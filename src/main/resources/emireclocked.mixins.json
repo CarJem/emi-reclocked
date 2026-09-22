@@ -10,6 +10,8 @@
     "EmiTagsSortMixin",
     "EmiStackListReloadGuardMixin",
     "ItemGroupTimingMixin",
-    "EmiRecipesBakeMixin"
+    "EmiRecipesBakeMixin",
+    "EmiRecipeRemainderMixin",
+    "EmiItemStackSerializerMixin"
   ]
 }

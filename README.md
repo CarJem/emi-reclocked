@@ -74,7 +74,54 @@ open, so a player opening their own creative inventory is never logged. Output l
 This is exactly the data needed to point a follow-up optimization pass at a specific mod
 instead of guessing - use it once you're back on your main pack.
 
-### Fix #4 - REMI reload-step parallelization: investigated, not shipped
+### Fix #4 - crafting remainder shortcut (default on)
+
+`EmiShapedRecipe`/`EmiShapelessRecipe`'s shared `setRemainders(...)` helper resolves each input
+slot's crafting remainder (e.g. a water bucket leaving behind an empty bucket) by, for every
+candidate item in that slot, copying every *other* slot's first candidate into a scratch 3x3
+`TransientCraftingContainer`, building a full `CraftingInput` from it, and calling
+`recipe.getRemainingItems(input)` just to read back the one index that corresponds to the slot
+being tested - repeated once per candidate item, for every shaped/shapeless recipe any plugin
+registers.
+
+`Recipe#getRemainingItems(CraftingInput)`'s default implementation doesn't touch the grid at all:
+it's a flat loop mapping each slot's own item through `ItemStack#hasCraftingRemainingItem()` /
+`getCraftingRemainingItem()`, independent of every other slot. Vanilla only overrides it for
+`BannerDuplicateRecipe` and `BookCloningRecipe` - both of which EMI already handles through their
+own dedicated recipe classes, never through `EmiShapedRecipe`/`EmiShapelessRecipe`. So for every
+recipe that actually reaches this method, EMI was rebuilding a 9-slot crafting grid per candidate
+item to re-derive an answer that only ever depended on that one item.
+
+`EmiRecipeRemainderMixin` checks, once per recipe *class* (reflection result cached), whether
+`getRemainingItems` is still `Recipe`'s literal default anywhere in that class's hierarchy. Only
+then does it replace the whole method with the equivalent flat per-item check. Any recipe class
+that overrides `getRemainingItems` - or if the reflective check fails for any reason - is left
+completely untouched and falls through to EMI's original grid-simulation path, so this can never
+disagree with a recipe's own custom remainder logic; it only skips work that was provably always
+going to reproduce vanilla's default answer. This was found by pointing fix #3's diagnostics at a
+large real modpack and disassembling the single most expensive step that turned up.
+
+### Fix #5 - cheap exception for missing item ids (default on)
+
+`ItemEmiStackSerializer.create(...)` resolves a saved item id via
+`EmiPort.getItemRegistry().getHolder(id).orElseThrow()`. Any EMI data file that references an
+item id absent from the current instance - a stale `index/stacks` removal/filter list a mod ships
+for a different pack, an item renamed or removed since the data was written, etc. - throws here.
+The exception is always immediately caught by `EmiStackSerializer#deserialize`'s generic
+`catch (Exception)` (logs "Error parsing NBT in deserialized stack", falls back to
+`EmiStack.EMPTY` - both unchanged by this mixin), so only the construction cost matters, not the
+exception's contents. `Optional#orElseThrow()`'s default `NoSuchElementException` fills in a full
+stack trace on construction, and this call sits many frames deep under every other mod's mixins
+into the EMI reload path, so each fill-in walks a long frame stack. One real pack test with a
+data file referencing ~985 ids that no longer resolved saw exactly this pattern land squarely in
+the index-baking phase.
+
+`EmiItemStackSerializerMixin` redirects just the `orElseThrow()` call to throw an exception whose
+`fillInStackTrace()` is a no-op instead, when the value is genuinely absent - the caught type, the
+log message, and the `EmiStack.EMPTY` fallback are all unchanged; only the cost of the
+already-discarded stack trace is removed.
+
+### Fix #6 - REMI reload-step parallelization: investigated, not shipped
 
 REMI's `EmiReloadManagerReloadWorkerMixin` runs `StackGroupManager.reload()`,
 `StackManager.reload()`, `CreativeModeTabManager.reload()` and `WorkstationSidebarManager.
@@ -84,6 +131,31 @@ calls `StackGroupManager.buildGroupedEmiStacksAndStackGroupToContents(...)`, whi
 group *definitions* `StackGroupManager.reload()` just loaded from JSON. Parallelizing them would
 be a race, not a safe win, so this was dropped per this mod's "behavior-preserving only" rule
 rather than shipped as a guess.
+
+### Fix #7 - plugin `register()` loop parallelization: investigated, not shipped
+
+`EmiReloadManager$ReloadWorker` calls every loaded plugin's `register(EmiRegistry)` sequentially
+on one thread - on one real pack this loop alone took ~70s out of a 172s reload, split across
+~30 plugins (one JEI-compat bridge alone took 24.7s; EMI's own vanilla plugin, helped some by fix
+#4, still took several seconds). `EmiRegistry`'s own methods are all either pure writes into
+EMI's static registries or reads (`getRecipeManager()`, `isStackDisabled(...)`) backed by state
+that's fully built *before* this loop starts and never mutated during it - so calls made purely
+through that interface would be safe to run concurrently and replay in original order afterward.
+The real risk is everything *outside* that interface: `EmiRecipes`, `EmiStackList` and friends are
+public statics, and a pack this size runs ~30 third-party plugins we have no way to audit for
+reaching past `EmiRegistry` straight into those collections. Two threads calling
+`ArrayList#add` on the same list concurrently is exactly the kind of silent, pack-dependent
+corruption this mod's "behavior-preserving only" rule exists to avoid shipping as a guess - so
+this stays uninvestigated further unless a way to detect or fence off that off-interface access
+turns up.
+
+Also investigated: the ~53s `[EMI] Reloading item groups on client thread` block (which fix #3
+times the inside of, tab by tab) starts with a ~31s stretch where no tab has started building yet
+at all. That isn't EMI doing hidden work - it's the render thread being busy with other startup
+work (chunk/world loading, other mods' loading-screen hooks) before it even reaches the task EMI
+queued for it. Nothing in EMI's reload pipeline is doing redundant work there, so there's nothing
+for a behavior-preserving mixin to remove; it's a general render-thread-contention-during-world-
+load problem, outside this mod's scope.
 
 ## Config
 
@@ -111,6 +183,10 @@ anything:
    - `[EMI Reclocked] Creative tab '...' took ...ms` lines during reload (fix #3).
    - Toggle `skipUnsortedRecipeBake` in the config and confirm recipes still populate
      correctly after reload either way (fix #2).
+   - No repeated `[EMI Reclocked] Could not verify getRemainingItems for ...` warnings for
+     vanilla `ShapedRecipe`/`ShapelessRecipe` - if those show up, fix #4's reflective check is
+     failing to recognize vanilla's own recipe classes and is falling back on every recipe (still
+     correct, just not doing anything).
 4. For a real read on which fixes matter for *your* pack, install this alongside your actual
    modpack, join a world, and compare the fix #3 log output and EMI's own existing
    "Reloaded EMI in ...ms" line with and without this mod installed.
